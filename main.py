@@ -15,6 +15,9 @@ BASE_DIR = "GIS"
 SPC_DIR = os.path.join(BASE_DIR, "SPC")
 UPDATE_INTERVAL = 900
 
+WARREN_LAT = 36.99
+WARREN_LON = -86.44
+
 SPC_URLS = {
     "Day1": "https://www.spc.noaa.gov/products/outlook/day1otlk-shp.zip",
     "Day2": "https://www.spc.noaa.gov/products/outlook/day2otlk-shp.zip",
@@ -22,18 +25,17 @@ SPC_URLS = {
 }
 
 RISK_COLORS = {
-    "TSTM": "#66ccff",
-    "MRGL": "#00ff00",
-    "SLGT": "#ffff00",
-    "ENH": "#ff9900",
-    "MDT": "#ff0000",
-    "HIGH": "#cc00cc",
+    "TSTM": "#C6E2FF",
+    "MRGL": "#66C266",
+    "SLGT": "#FFD700",
+    "ENH": "#FF8C00",
+    "MDT": "#FF0000",
+    "HIGH": "#CC00CC",
 }
 
 # ---------------- SETUP ----------------
 
-def ensure_dir():
-    os.makedirs(SPC_DIR, exist_ok=True)
+os.makedirs(SPC_DIR, exist_ok=True)
 
 def download_and_extract(url):
     filename = os.path.join(SPC_DIR, url.split("/")[-1])
@@ -50,15 +52,15 @@ def update_spc():
     for url in SPC_URLS.values():
         download_and_extract(url)
 
-# ---------------- BACKGROUND THREAD ----------------
-
 def scheduler():
     while True:
-        update_spc()
+        try:
+            update_spc()
+        except:
+            pass
         time.sleep(UPDATE_INTERVAL)
 
 if "scheduler_started" not in st.session_state:
-    ensure_dir()
     thread = threading.Thread(target=scheduler, daemon=True)
     thread.start()
     st.session_state.scheduler_started = True
@@ -66,27 +68,48 @@ if "scheduler_started" not in st.session_state:
 # ---------------- LOAD SHAPEFILE ----------------
 
 def load_day(day):
-    files = [
+    shp_files = [
         os.path.join(SPC_DIR, f)
         for f in os.listdir(SPC_DIR)
         if day.lower() in f.lower() and f.endswith(".shp")
     ]
-    if not files:
+    if not shp_files:
         return None, None
 
-    latest = max(files, key=os.path.getmtime)
+    latest = max(shp_files, key=os.path.getmtime)
     sf = shapefile.Reader(latest)
     return sf, latest
+
+# ---------------- NWS ALERT COUNTS ----------------
+
+def get_warren_alert_counts():
+    url = "https://api.weather.gov/alerts/active?area=KY"
+    r = requests.get(url, timeout=30)
+    data = r.json()
+
+    warnings = 0
+    watches = 0
+    advisories = 0
+
+    for feature in data["features"]:
+        props = feature["properties"]
+        area_desc = props.get("areaDesc", "")
+
+        if "Warren" in area_desc:
+            event = props.get("event", "")
+            if "Warning" in event:
+                warnings += 1
+            elif "Watch" in event:
+                watches += 1
+            elif "Advisory" in event:
+                advisories += 1
+
+    return warnings, watches, advisories
 
 # ---------------- MAP ----------------
 
 def render_map(sf):
-    bbox = sf.bbox  # [xmin, ymin, xmax, ymax]
-    center_lat = (bbox[1] + bbox[3]) / 2
-    center_lon = (bbox[0] + bbox[2]) / 2
-
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=5)
-    m.fit_bounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
+    m = folium.Map(location=[WARREN_LAT, WARREN_LON], zoom_start=7)
 
     # Radar
     folium.TileLayer(
@@ -117,38 +140,48 @@ def render_map(sf):
             style_function=lambda x, c=color: {
                 "fillColor": c,
                 "color": "black",
-                "weight": 1,
-                "fillOpacity": 0.5,
+                "weight": 2,
+                "fillOpacity": 0.55,
             },
         ).add_to(m)
+
+    # Warren County marker
+    folium.CircleMarker(
+        location=[WARREN_LAT, WARREN_LON],
+        radius=8,
+        color="blue",
+        fill=True,
+        fill_color="blue",
+    ).add_to(m)
 
     folium.LayerControl().add_to(m)
     return m
 
-# ---------------- STREAMLIT ----------------
+# ---------------- STREAMLIT UI ----------------
 
 st.set_page_config(layout="wide")
-st.title("Operational Severe Weather Dashboard")
+st.title("DSOC Severe Weather Situation Dashboard")
 
-day_choice = st.radio("Select Outlook Day", ["Day1", "Day2", "Day3"], horizontal=True)
+warnings, watches, advisories = get_warren_alert_counts()
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Warnings (Warren Co.)", warnings)
+col2.metric("Watches (Warren Co.)", watches)
+col3.metric("Advisories (Warren Co.)", advisories)
+
+st.divider()
+
+day_choice = st.radio("SPC Outlook", ["Day1", "Day2", "Day3"], horizontal=True)
 
 sf, filepath = load_day(day_choice)
 
 if sf is None:
-    st.warning("Waiting for background data download...")
+    st.warning("Waiting for SPC data...")
 else:
     mod_time = datetime.utcfromtimestamp(os.path.getmtime(filepath))
     age_minutes = int((datetime.utcnow() - mod_time).total_seconds() / 60)
 
-    col1, col2 = st.columns(2)
-    col1.metric("Last Updated (UTC)", mod_time.strftime("%Y-%m-%d %H:%M"))
-    col2.metric("Dataset Age (minutes)", age_minutes)
-
-    st.divider()
+    st.caption(f"SPC Data Age: {age_minutes} minutes")
 
     m = render_map(sf)
     st_folium(m, width=1200, height=700)
-
-    st.markdown("### Risk Legend")
-    for k, v in RISK_COLORS.items():
-        st.markdown(f"<span style='color:{v};font-weight:bold'>■ {k}</span>", unsafe_allow_html=True)
