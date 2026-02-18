@@ -2,7 +2,6 @@ import streamlit as st
 import os
 import requests
 import zipfile
-import threading
 import time
 from datetime import datetime
 import shapefile
@@ -13,7 +12,7 @@ from streamlit_folium import st_folium
 
 BASE_DIR = "GIS"
 SPC_DIR = os.path.join(BASE_DIR, "SPC")
-UPDATE_INTERVAL = 900
+os.makedirs(SPC_DIR, exist_ok=True)
 
 WARREN_LAT = 36.99
 WARREN_LON = -86.44
@@ -33,13 +32,17 @@ RISK_COLORS = {
     "HIGH": "#CC00CC",
 }
 
-# ---------------- SETUP ----------------
+MD_URL = "https://www.spc.noaa.gov/products/md/md_latest.geojson"
 
-os.makedirs(SPC_DIR, exist_ok=True)
+# ---------------- DOWNLOAD ----------------
 
 def download_and_extract(url):
     filename = os.path.join(SPC_DIR, url.split("/")[-1])
+
     r = requests.get(url, timeout=60)
+    if r.status_code != 200:
+        raise Exception(f"Failed to download {url}")
+
     with open(filename, "wb") as f:
         f.write(r.content)
 
@@ -48,63 +51,26 @@ def download_and_extract(url):
 
     os.remove(filename)
 
-def update_spc():
-    for url in SPC_URLS.values():
-        download_and_extract(url)
+@st.cache_data(ttl=900)
+def ensure_spc_downloaded():
+    if not any(f.endswith(".shp") for f in os.listdir(SPC_DIR)):
+        for url in SPC_URLS.values():
+            download_and_extract(url)
+        return "Downloaded"
+    return "Exists"
 
-def scheduler():
-    while True:
-        try:
-            update_spc()
-        except:
-            pass
-        time.sleep(UPDATE_INTERVAL)
+# ---------------- LOAD ----------------
 
-if "scheduler_started" not in st.session_state:
-    thread = threading.Thread(target=scheduler, daemon=True)
-    thread.start()
-    st.session_state.scheduler_started = True
-
-# ---------------- LOAD SHAPEFILE ----------------
-
-def load_day(day):
-    shp_files = [
+def load_spc(day):
+    files = [
         os.path.join(SPC_DIR, f)
         for f in os.listdir(SPC_DIR)
         if day.lower() in f.lower() and f.endswith(".shp")
     ]
-    if not shp_files:
-        return None, None
-
-    latest = max(shp_files, key=os.path.getmtime)
-    sf = shapefile.Reader(latest)
-    return sf, latest
-
-# ---------------- NWS ALERT COUNTS ----------------
-
-def get_warren_alert_counts():
-    url = "https://api.weather.gov/alerts/active?area=KY"
-    r = requests.get(url, timeout=30)
-    data = r.json()
-
-    warnings = 0
-    watches = 0
-    advisories = 0
-
-    for feature in data["features"]:
-        props = feature["properties"]
-        area_desc = props.get("areaDesc", "")
-
-        if "Warren" in area_desc:
-            event = props.get("event", "")
-            if "Warning" in event:
-                warnings += 1
-            elif "Watch" in event:
-                watches += 1
-            elif "Advisory" in event:
-                advisories += 1
-
-    return warnings, watches, advisories
+    if not files:
+        return None
+    latest = max(files, key=os.path.getmtime)
+    return shapefile.Reader(latest), latest
 
 # ---------------- MAP ----------------
 
@@ -127,7 +93,7 @@ def render_map(sf):
         overlay=False,
     ).add_to(m)
 
-    fields = [field[0] for field in sf.fields[1:]]
+    fields = [f[0] for f in sf.fields[1:]]
 
     for sr in sf.shapeRecords():
         geom = sr.shape.__geo_interface__
@@ -141,47 +107,47 @@ def render_map(sf):
                 "fillColor": c,
                 "color": "black",
                 "weight": 2,
-                "fillOpacity": 0.55,
+                "fillOpacity": 0.6,
             },
         ).add_to(m)
 
-    # Warren County marker
-    folium.CircleMarker(
-        location=[WARREN_LAT, WARREN_LON],
-        radius=8,
-        color="blue",
-        fill=True,
-        fill_color="blue",
-    ).add_to(m)
+    # Mesoscale Discussions
+    md_data = requests.get(MD_URL, timeout=30).json()
+
+    for feature in md_data["features"]:
+        folium.GeoJson(
+            feature["geometry"],
+            tooltip=f"MD #{feature['properties']['md_number']}",
+            popup=feature["properties"]["headline"],
+            style_function=lambda x: {"color": "purple", "weight": 3},
+        ).add_to(m)
 
     folium.LayerControl().add_to(m)
     return m
 
-# ---------------- STREAMLIT UI ----------------
+# ---------------- STREAMLIT ----------------
 
 st.set_page_config(layout="wide")
-st.title("DSOC Severe Weather Situation Dashboard")
+st.title("DSOC Operational Weather Dashboard")
 
-warnings, watches, advisories = get_warren_alert_counts()
+status = ensure_spc_downloaded()
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Warnings (Warren Co.)", warnings)
-col2.metric("Watches (Warren Co.)", watches)
-col3.metric("Advisories (Warren Co.)", advisories)
-
-st.divider()
+if status == "Downloaded":
+    st.success("SPC outlook data downloaded.")
+else:
+    st.info("SPC data ready.")
 
 day_choice = st.radio("SPC Outlook", ["Day1", "Day2", "Day3"], horizontal=True)
 
-sf, filepath = load_day(day_choice)
+sf_data = load_spc(day_choice)
 
-if sf is None:
-    st.warning("Waiting for SPC data...")
-else:
+if sf_data:
+    sf, filepath = sf_data
     mod_time = datetime.utcfromtimestamp(os.path.getmtime(filepath))
     age_minutes = int((datetime.utcnow() - mod_time).total_seconds() / 60)
-
     st.caption(f"SPC Data Age: {age_minutes} minutes")
 
     m = render_map(sf)
     st_folium(m, width=1200, height=700)
+else:
+    st.error("SPC shapefile not found after download attempt.")
