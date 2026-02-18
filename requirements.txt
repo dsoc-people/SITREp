@@ -1,5 +1,6 @@
 streamlit==1.32.2
-folium==0.16.0
 streamlit-folium==0.18.0
+streamlit-autorefresh==1.0.1
+folium==0.16.0
 requests==2.31.0
 pyshp==2.3.1
