@@ -5,16 +5,15 @@ import zipfile
 import threading
 import time
 from datetime import datetime
-import geopandas as gpd
+import shapefile
 import folium
 from streamlit_folium import st_folium
 
-# ------------------ CONFIG ------------------
+# ---------------- CONFIG ----------------
 
 BASE_DIR = "GIS"
-SPC_CONVECTIVE_DIR = os.path.join(BASE_DIR, "Outlooks", "SPC", "Convective")
-
-UPDATE_INTERVAL = 900  # 15 minutes background update
+SPC_DIR = os.path.join(BASE_DIR, "SPC")
+UPDATE_INTERVAL = 900
 
 SPC_URLS = {
     "Day1": "https://www.spc.noaa.gov/products/outlook/day1otlk-shp.zip",
@@ -31,20 +30,19 @@ RISK_COLORS = {
     "HIGH": "#cc00cc",
 }
 
-# ------------------ SETUP ------------------
+# ---------------- SETUP ----------------
 
-def ensure_directories():
-    os.makedirs(SPC_CONVECTIVE_DIR, exist_ok=True)
+def ensure_dir():
+    os.makedirs(SPC_DIR, exist_ok=True)
 
 def download_and_extract(url):
-    filename = os.path.join(SPC_CONVECTIVE_DIR, url.split("/")[-1])
-
+    filename = os.path.join(SPC_DIR, url.split("/")[-1])
     r = requests.get(url, timeout=60)
     with open(filename, "wb") as f:
         f.write(r.content)
 
     with zipfile.ZipFile(filename, "r") as zip_ref:
-        zip_ref.extractall(SPC_CONVECTIVE_DIR)
+        zip_ref.extractall(SPC_DIR)
 
     os.remove(filename)
 
@@ -52,7 +50,7 @@ def update_spc():
     for url in SPC_URLS.values():
         download_and_extract(url)
 
-# ------------------ BACKGROUND THREAD ------------------
+# ---------------- BACKGROUND THREAD ----------------
 
 def scheduler():
     while True:
@@ -60,92 +58,85 @@ def scheduler():
         time.sleep(UPDATE_INTERVAL)
 
 if "scheduler_started" not in st.session_state:
-    ensure_directories()
+    ensure_dir()
     thread = threading.Thread(target=scheduler, daemon=True)
     thread.start()
     st.session_state.scheduler_started = True
 
-# ------------------ LOAD SHAPEFILE ------------------
+# ---------------- LOAD SHAPEFILE ----------------
 
 def load_day(day):
     files = [
-        os.path.join(SPC_CONVECTIVE_DIR, f)
-        for f in os.listdir(SPC_CONVECTIVE_DIR)
+        os.path.join(SPC_DIR, f)
+        for f in os.listdir(SPC_DIR)
         if day.lower() in f.lower() and f.endswith(".shp")
     ]
     if not files:
-        return None
+        return None, None
+
     latest = max(files, key=os.path.getmtime)
-    return gpd.read_file(latest), latest
+    sf = shapefile.Reader(latest)
+    return sf, latest
 
-# ------------------ MAP ------------------
+# ---------------- MAP ----------------
 
-def style_function(feature):
-    risk = feature["properties"].get("DN", "")
-    color = RISK_COLORS.get(risk, "#999999")
-    return {
-        "fillColor": color,
-        "color": "black",
-        "weight": 1,
-        "fillOpacity": 0.5,
-    }
-
-def render_map(gdf):
-    gdf = gdf.to_crs(epsg=4326)
-    bounds = gdf.total_bounds  # xmin, ymin, xmax, ymax
-
-    center_lat = (bounds[1] + bounds[3]) / 2
-    center_lon = (bounds[0] + bounds[2]) / 2
+def render_map(sf):
+    bbox = sf.bbox  # [xmin, ymin, xmax, ymax]
+    center_lat = (bbox[1] + bbox[3]) / 2
+    center_lon = (bbox[0] + bbox[2]) / 2
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=5)
+    m.fit_bounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]])
 
-    # Auto zoom to bounds
-    m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
-
-    # Radar layer
+    # Radar
     folium.TileLayer(
         tiles="https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0r/{z}/{x}/{y}.png",
         attr="NEXRAD",
         name="Radar",
         overlay=True,
-        control=True,
     ).add_to(m)
 
-    # Satellite layer
+    # Satellite
     folium.TileLayer(
         tiles="https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri",
         name="Satellite",
         overlay=False,
-        control=True,
     ).add_to(m)
 
-    folium.GeoJson(
-        gdf,
-        style_function=style_function,
-        name="SPC Outlook",
-    ).add_to(m)
+    fields = [field[0] for field in sf.fields[1:]]
+
+    for sr in sf.shapeRecords():
+        geom = sr.shape.__geo_interface__
+        record = dict(zip(fields, sr.record))
+        risk = record.get("DN", "")
+        color = RISK_COLORS.get(risk, "#999999")
+
+        folium.GeoJson(
+            geom,
+            style_function=lambda x, c=color: {
+                "fillColor": c,
+                "color": "black",
+                "weight": 1,
+                "fillOpacity": 0.5,
+            },
+        ).add_to(m)
 
     folium.LayerControl().add_to(m)
-
     return m
 
-# ------------------ STREAMLIT UI ------------------
+# ---------------- STREAMLIT ----------------
 
 st.set_page_config(layout="wide")
 st.title("Operational Severe Weather Dashboard")
 
-# Layer Toggle
 day_choice = st.radio("Select Outlook Day", ["Day1", "Day2", "Day3"], horizontal=True)
 
-result = load_day(day_choice)
+sf, filepath = load_day(day_choice)
 
-if result is None:
-    st.warning("No shapefile found yet. Waiting for background update.")
+if sf is None:
+    st.warning("Waiting for background data download...")
 else:
-    gdf, filepath = result
-
-    # Dataset Age Panel
     mod_time = datetime.utcfromtimestamp(os.path.getmtime(filepath))
     age_minutes = int((datetime.utcnow() - mod_time).total_seconds() / 60)
 
@@ -155,7 +146,7 @@ else:
 
     st.divider()
 
-    m = render_map(gdf)
+    m = render_map(sf)
     st_folium(m, width=1200, height=700)
 
     st.markdown("### Risk Legend")
