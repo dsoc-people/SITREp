@@ -58,11 +58,7 @@ def build_map(lat, lon):
 st.sidebar.title("Locations")
 
 cities = [
-    "New York",
-    "Los Angeles",
-    "Chicago",
-    "Houston",
-    "Miami"
+    "Bowling Green"
 ]
 
 selected_city = st.sidebar.selectbox(
